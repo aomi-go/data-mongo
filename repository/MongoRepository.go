@@ -125,7 +125,6 @@ func (d MongoRepository) FindAll(filter interface{}, pageable datacommon.Pageabl
 		panic(err.(any))
 	}
 
-	//var content []interface{}
 	var contentValue = reflect.MakeSlice(d.entitySliceType, 0, 0)
 
 	for cursor.Next(context.TODO()) {
