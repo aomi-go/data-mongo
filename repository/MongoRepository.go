@@ -2,6 +2,7 @@ package repository
 
 import (
 	"context"
+	"errors"
 	datacommon "github.com/aomi-go/data-common"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
@@ -11,59 +12,52 @@ import (
 )
 
 type MongoRepository struct {
-	Datasource      *mongo.Database
+	// Database 数据库数据源信息
+	Database *mongo.Database
+	// EntityType 数据对象结构体类型
 	EntityType      reflect.Type
-	entitySliceType reflect.Type
-
-	collection     *mongo.Collection
-	collectionName string
-}
-
-type NewOptions struct {
-	Datasource     *mongo.Database
-	EntityType     reflect.Type
+	EntitySliceType reflect.Type
+	// EntityType 对应的数据库集合名称,可选参数，默认使用结构体类型名称作为集合名称
 	CollectionName string
+	Collection     *mongo.Collection
 }
 
-func NewMongoRepository(opts *NewOptions) *MongoRepository {
-	repo := &MongoRepository{
-		Datasource:      opts.Datasource,
-		EntityType:      opts.EntityType,
-		entitySliceType: reflect.SliceOf(opts.EntityType),
+func NewMongoRepo(database *mongo.Database, entityType reflect.Type, collectionName string) MongoRepository {
+	if nil == database {
+		panic(errors.New("mongo database 不能为 nil").(any))
+	}
+	if nil == entityType {
+		panic(errors.New("实体类型不能为 nil").(any))
 	}
 
-	var cName string
-	if "" == opts.CollectionName {
-		tmpName := opts.EntityType.Name()
-		cName = strings.ToLower(string(tmpName[0])) + tmpName[1:]
-	} else {
-		cName = opts.CollectionName
+	if "" == collectionName {
+		collectionName = entityType.Name()
+		collectionName = strings.ToLower(string(collectionName[0])) + collectionName[1:]
 	}
-	repo.collectionName = cName
+
+	collection := database.Collection(collectionName)
+
+	repo := MongoRepository{
+		Database:        database,
+		EntityType:      entityType,
+		EntitySliceType: reflect.SliceOf(entityType),
+		CollectionName:  collectionName,
+		Collection:      collection,
+	}
+
 	return repo
 }
 
-func (d MongoRepository) GetCollection() *mongo.Collection {
-	if nil != d.collection {
-		return d.collection
-	}
-
-	if "" != d.collectionName {
-		d.collection = d.Datasource.Collection(d.collectionName)
-	}
-	return d.collection
-}
-
-func (d MongoRepository) Save(entity interface{}) interface{} {
-	_, err := d.GetCollection().InsertOne(context.TODO(), entity)
+func (d *MongoRepository) Save(entity interface{}) interface{} {
+	_, err := d.Collection.InsertOne(context.TODO(), entity)
 	if err != nil {
 		panic(err.(any))
 	}
 	return entity
 }
 
-func (d MongoRepository) FindById(id interface{}) interface{} {
-	result := d.GetCollection().FindOne(context.TODO(), bson.D{{
+func (d *MongoRepository) FindById(id interface{}) interface{} {
+	result := d.Collection.FindOne(context.TODO(), bson.D{{
 		"_id", id,
 	}})
 	if nil != result.Err() {
@@ -77,8 +71,8 @@ func (d MongoRepository) FindById(id interface{}) interface{} {
 	return &item
 }
 
-func (d MongoRepository) ExistsById(id *interface{}) bool {
-	count, err := d.GetCollection().CountDocuments(context.TODO(), bson.D{{
+func (d *MongoRepository) ExistsById(id *interface{}) bool {
+	count, err := d.Collection.CountDocuments(context.TODO(), bson.D{{
 		"_id", id,
 	}})
 	if err != nil {
@@ -87,8 +81,8 @@ func (d MongoRepository) ExistsById(id *interface{}) bool {
 	return count > 0
 }
 
-func (d MongoRepository) DeleteById(id interface{}) bool {
-	result, err := d.GetCollection().DeleteOne(context.TODO(), bson.D{{
+func (d *MongoRepository) DeleteById(id interface{}) bool {
+	result, err := d.Collection.DeleteOne(context.TODO(), bson.D{{
 		"_id", id,
 	}})
 	if err != nil {
@@ -97,8 +91,29 @@ func (d MongoRepository) DeleteById(id interface{}) bool {
 	return result.DeletedCount > 0
 }
 
+func (d *MongoRepository) FindOne(filter interface{}, opts ...*options.FindOneOptions) interface{} {
+	item := reflect.New(d.EntityType)
+	err := d.Collection.FindOne(context.TODO(), filter, opts...).Decode(item.Interface())
+	if err != nil {
+		if err == mongo.ErrNoDocuments {
+			// This error means your query did not match any documents.
+			return nil
+		}
+		panic(err.(any))
+	}
+	return item
+}
+
+func (d *MongoRepository) Find(filter interface{}, opts ...*options.FindOptions) interface{} {
+	cursor, err := d.Collection.Find(context.TODO(), filter, opts...)
+	if nil != err {
+		panic(err.(any))
+	}
+	return d.getContent(cursor, err)
+}
+
 //FindAll 查询所有带分页排序
-func (d MongoRepository) FindAll(filter interface{}, pageable datacommon.Pageable, opts ...*options.FindOptions) *datacommon.Page {
+func (d *MongoRepository) FindAll(filter interface{}, pageable datacommon.Pageable, opts ...*options.FindOptions) *datacommon.Page {
 
 	finalOpts := opts
 	var totalElements int64 = 0
@@ -112,7 +127,7 @@ func (d MongoRepository) FindAll(filter interface{}, pageable datacommon.Pageabl
 			Limit: &limit,
 		})
 
-		t, err := d.GetCollection().CountDocuments(context.TODO(), filter)
+		t, err := d.Collection.CountDocuments(context.TODO(), filter)
 
 		if nil != err {
 			panic(err.(any))
@@ -120,22 +135,25 @@ func (d MongoRepository) FindAll(filter interface{}, pageable datacommon.Pageabl
 		totalElements = t
 	}
 
-	cursor, err := d.GetCollection().Find(context.TODO(), filter, finalOpts...)
+	cursor, err := d.Collection.Find(context.TODO(), filter, finalOpts...)
+	content := d.getContent(cursor, err)
+	return datacommon.Of(content, pageable, totalElements)
+}
+
+func (repo *MongoRepository) getContent(cursor *mongo.Cursor, err error) interface{} {
 	if nil != err {
 		panic(err.(any))
 	}
 
-	var contentValue = reflect.MakeSlice(d.entitySliceType, 0, 0)
+	var contentValue = reflect.MakeSlice(repo.EntitySliceType, 0, 0)
 
 	for cursor.Next(context.TODO()) {
-		item := reflect.New(d.EntityType)
+		item := reflect.New(repo.EntityType)
 		e := cursor.Decode(item.Interface())
 		if e != nil {
 			panic(e.(any))
 		}
 		contentValue = reflect.Append(contentValue, item.Elem())
 	}
-	content := contentValue.Interface()
-
-	return datacommon.Of(content, pageable, totalElements)
+	return contentValue.Interface()
 }
