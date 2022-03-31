@@ -22,6 +22,7 @@ type MongoRepository struct {
 	Collection     *mongo.Collection
 }
 
+// NewMongoRepo 创建一个MongoRepository 实例
 func NewMongoRepo(database *mongo.Database, entityType reflect.Type, collectionName string) MongoRepository {
 	if nil == database {
 		panic(errors.New("mongo database 不能为 nil").(any))
